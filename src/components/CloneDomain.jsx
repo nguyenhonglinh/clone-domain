@@ -25,11 +25,26 @@ import {
   InputLabel,
   Stack,
 } from "@mui/material";
-import { collection, getDocs, query, orderBy, limit } from "firebase/firestore";
+import {
+  collection,
+  getDocs,
+  query,
+  orderBy,
+  limit,
+  where,
+  deleteDoc,
+  doc,
+  updateDoc,
+  addDoc,
+} from "firebase/firestore";
+
 import { db } from "../firebase-config";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import SearchIcon from "@mui/icons-material/Search";
 import RocketLaunchIcon from "@mui/icons-material/RocketLaunch";
+import DeleteIcon from "@mui/icons-material/Delete";
+import EditIcon from "@mui/icons-material/Edit";
+import axios from "axios";
 
 const CloneDomain = () => {
   const theme = useTheme();
@@ -43,34 +58,72 @@ const CloneDomain = () => {
   const [searchTerm, setSearchTerm] = useState("");
   const [ageFilter, setAgeFilter] = useState("all");
   const [sortBy, setSortBy] = useState("index");
+  const [isScrapingData, setIsScrapingData] = useState(false);
+  const [scrapingStatus, setScrapingStatus] = useState(null);
+  const [sources, setSources] = useState([]);
+  const [selectedSource, setSelectedSource] = useState("");
+  const [selectedType, setSelectedType] = useState("");
+  const [viewType, setViewType] = useState("all");
 
-  const fetchDomains = async () => {
+  const fetchDomains = async (type = viewType) => {
     setLoading(true);
     setError(null);
     try {
-      const domainsQuery = query(
-        collection(db, "domain_data"),
-        orderBy("index", "asc"),
-        limit(100)
-      );
+      let domainsQuery;
+      
+      if (type === "all") {
+        // Nếu chọn "all" thì lấy tất cả domain
+        domainsQuery = query(
+          collection(db, "domains"),
+          orderBy("createdAt", "desc")
+        );
+      } else {
+        // Nếu chọn specific type thì lọc theo auctionStatus
+        domainsQuery = query(
+          collection(db, "domains"),
+          where("auctionStatus", "==", type),
+          orderBy("createdAt", "desc")
+        );
+      }
 
       const querySnapshot = await getDocs(domainsQuery);
 
       if (querySnapshot.empty) {
-        setError("Không có dữ liệu domain nào trong database");
+        setError(`Không có dữ liệu domain nào${type !== 'all' ? ` cho loại "${type}"` : ''}`);
+        setDomains([]);
+        setFilteredDomains([]);
         return;
       }
 
-      const domainsData = querySnapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
+      const domainMap = new Map();
+      querySnapshot.docs.forEach((doc) => {
+        const data = doc.data();
+        const domain = data.domain.toLowerCase();
+        const timestamp = data.createdAt?.toDate();
 
-      setDomains(domainsData);
-      setFilteredDomains(domainsData);
+        if (!domainMap.has(domain) || 
+            timestamp > domainMap.get(domain).timestamp) {
+          domainMap.set(domain, {
+            id: doc.id,
+            ...data,
+            timestamp,
+            createdAt: timestamp.toLocaleString()
+          });
+        }
+      });
+
+      const uniqueDomains = Array.from(domainMap.values())
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .map(domain => {
+          const { timestamp, ...rest } = domain;
+          return rest;
+        });
+
+      setDomains(uniqueDomains);
+      setFilteredDomains(uniqueDomains);
     } catch (error) {
-      console.error("Lỗi khi lấy dữ liệu từ Firestore: ", error);
-      setError("Không thể kết nối với database. Vui lòng thử lại sau.");
+      console.error("Lỗi khi lấy dữ liệu:", error);
+      setError("Không thể kết nối với database");
     } finally {
       setLoading(false);
     }
@@ -85,10 +138,25 @@ const CloneDomain = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchTerm, ageFilter, sortBy, domains]);
 
+  useEffect(() => {
+    const fetchSources = async () => {
+      try {
+        const response = await axios.get("http://localhost:5001/sources");
+        if (response.data.success) {
+          console.log("Sources loaded:", response.data.sources); // Debug
+          setSources(response.data.sources);
+        }
+      } catch (error) {
+        console.error("Lỗi khi lấy danh sách sources:", error);
+        setError("Không thể lấy danh sách nguồn. Vui lòng thử lại sau.");
+      }
+    };
+    fetchSources();
+  }, []);
+
   const filterDomains = () => {
     let filtered = [...domains];
 
-    // Tìm kiếm
     if (searchTerm) {
       filtered = filtered.filter(
         (domain) =>
@@ -97,7 +165,6 @@ const CloneDomain = () => {
       );
     }
 
-    // Lọc theo độ tuổi
     if (ageFilter !== "all") {
       const [min, max] = ageFilter.split("-").map(Number);
       filtered = filtered.filter(
@@ -105,7 +172,6 @@ const CloneDomain = () => {
       );
     }
 
-    // Sắp xếp
     filtered.sort((a, b) => {
       switch (sortBy) {
         case "domain":
@@ -124,6 +190,170 @@ const CloneDomain = () => {
   const handleChangePage = (event, newPage) => {
     setPage(newPage);
   };
+
+  const handleScrapeData = async () => {
+    if (!selectedSource || !selectedType) {
+      setError("Vui lòng chọn source và loại trang muốn thu thập");
+      return;
+    }
+
+    setIsScrapingData(true);
+    setScrapingStatus(`Đang thu thập dữ liệu từ ${selectedSource}...`);
+
+    try {
+      const response = await axios.get("http://localhost:5001/scrape-domains", {
+        params: {
+          source: selectedSource,
+          type: selectedType
+        },
+        timeout: 300000,
+      });
+
+      if (response.data && response.data.success && response.data.domains) {
+        setScrapingStatus("Đang lưu dữ liệu vào database...");
+
+        const batch = [];
+        response.data.domains.forEach((domain, index) => {
+          batch.push(
+            addDoc(collection(db, "domains"), {
+              ...domain,
+              createdAt: new Date(),
+              status: "active",
+              auctionStatus: selectedType === "auction-live" ? "live" : "closed"
+            })
+          );
+        });
+
+        await Promise.all(batch);
+        setScrapingStatus(
+          `Thu thập thành công ${response.data.domains.length} domain!`
+        );
+        
+        await fetchDomains(viewType);
+      }
+    } catch (error) {
+      console.error("Lỗi khi scrape dữ liệu:", error);
+
+      if (error.code === "ECONNREFUSED") {
+        setScrapingStatus(
+          "Không thể kết nối đến server. Vui lòng kiểm tra xem server backend đã được khởi động chưa!"
+        );
+      } else if (error.code === "ETIMEDOUT") {
+        setScrapingStatus(
+          "Quá trình thu thập dữ liệu mất quá nhiều thời gian. Vui lòng thử lại!"
+        );
+      } else if (error.response) {
+        setScrapingStatus(
+          `Lỗi từ server: ${
+            error.response.data.message || error.response.statusText
+          }`
+        );
+      } else {
+        setScrapingStatus(`Lỗi khi thu thập dữ liệu: ${error.message}`);
+      }
+    } finally {
+      setIsScrapingData(false);
+    }
+  };
+
+  const handleDeleteDomain = async (id) => {
+    try {
+      await deleteDoc(doc(db, "domains", id));
+      setDomains(domains.filter((domain) => domain.id !== id));
+      setFilteredDomains(filteredDomains.filter((domain) => domain.id !== id));
+    } catch (error) {
+      console.error("Lỗi khi xóa domain:", error);
+    }
+  };
+
+  const handleUpdateStatus = async (id, newStatus) => {
+    try {
+      const domainRef = doc(db, "domains", id);
+      await updateDoc(domainRef, { status: newStatus });
+      setDomains(
+        domains.map((domain) =>
+          domain.id === id ? { ...domain, status: newStatus } : domain
+        )
+      );
+      setFilteredDomains(
+        filteredDomains.map((domain) =>
+          domain.id === id ? { ...domain, status: newStatus } : domain
+        )
+      );
+    } catch (error) {
+      console.error("Lỗi khi cập nhật trạng thái:", error);
+    }
+  };
+
+  const TableRowContent = ({ domain, index }) => (
+    <TableRow
+      sx={{
+        "&:nth-of-type(odd)": {
+          backgroundColor: "#F8FAFC",
+        },
+        "&:hover": {
+          backgroundColor: "#E0F2FE",
+          transform: "scale(1.01)",
+          transition: "all 0.2s ease-in-out",
+        },
+      }}
+    >
+      <TableCell sx={{ padding: "16px 24px" }}>
+        {page * rowsPerPage + index + 1}
+      </TableCell>
+      <TableCell sx={{ padding: "16px 24px" }}>
+        <Typography
+          component="a"
+          href={domain.auctionUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          sx={{
+            color: "#0EA5E9",
+            fontWeight: "600",
+            fontSize: "0.875rem",
+            textDecoration: "none",
+            "&:hover": {
+              color: "#0369A1",
+              textDecoration: "underline",
+            },
+          }}
+        >
+          {domain.domain}
+        </Typography>
+      </TableCell>
+      <TableCell sx={{ display: { xs: "none", sm: "table-cell" } }}>
+        {domain.age} năm
+      </TableCell>
+      <TableCell sx={{ display: { xs: "none", md: "table-cell" } }}>
+        {domain.source}
+      </TableCell>
+      <TableCell sx={{ display: { xs: "none", md: "table-cell" } }}>
+        {domain.endDate}
+      </TableCell>
+      <TableCell sx={{ display: { xs: "none", md: "table-cell" } }}>
+        {domain.createdAt}
+      </TableCell>
+      <TableCell>
+        <Tooltip title="Xóa domain">
+          <IconButton onClick={() => handleDeleteDomain(domain.id)}>
+            <DeleteIcon sx={{ color: "#EF4444" }} />
+          </IconButton>
+        </Tooltip>
+        <Tooltip title="Cập nhật trạng thái">
+          <IconButton
+            onClick={() =>
+              handleUpdateStatus(
+                domain.id,
+                domain.status === "active" ? "inactive" : "active"
+              )
+            }
+          >
+            <EditIcon sx={{ color: "#10B981" }} />
+          </IconButton>
+        </Tooltip>
+      </TableCell>
+    </TableRow>
+  );
 
   if (loading) {
     return (
@@ -228,23 +458,52 @@ const CloneDomain = () => {
               </Typography>
             </Box>
 
-            <Tooltip title="Làm mới dữ liệu">
-              <IconButton
-                onClick={fetchDomains}
-                sx={{
-                  backgroundColor: "#F0F9FF",
-                  width: "48px",
-                  height: "48px",
-                  "&:hover": {
-                    backgroundColor: "#E0F2FE",
-                    transform: "scale(1.1) rotate(180deg)",
-                    transition: "all 0.3s ease-in-out",
-                  },
-                }}
-              >
-                <RefreshIcon sx={{ color: "#0EA5E9", fontSize: "24px" }} />
-              </IconButton>
-            </Tooltip>
+            <Box sx={{ display: "flex", gap: 2 }}>
+              <Tooltip title="Thu thập dữ liệu mới">
+                <IconButton
+                  onClick={handleScrapeData}
+                  disabled={isScrapingData}
+                  sx={{
+                    backgroundColor: "#F0F9FF",
+                    width: "48px",
+                    height: "48px",
+                    "&:hover": {
+                      backgroundColor: "#E0F2FE",
+                      transform: "scale(1.1)",
+                    },
+                    "&:disabled": {
+                      backgroundColor: "#E2E8F0",
+                    },
+                  }}
+                >
+                  {isScrapingData ? (
+                    <CircularProgress size={24} sx={{ color: "#0EA5E9" }} />
+                  ) : (
+                    <RocketLaunchIcon
+                      sx={{ color: "#0EA5E9", fontSize: "24px" }}
+                    />
+                  )}
+                </IconButton>
+              </Tooltip>
+
+              <Tooltip title="Làm mới dữ liệu">
+                <IconButton
+                  onClick={fetchDomains}
+                  sx={{
+                    backgroundColor: "#F0F9FF",
+                    width: "48px",
+                    height: "48px",
+                    "&:hover": {
+                      backgroundColor: "#E0F2FE",
+                      transform: "scale(1.1) rotate(180deg)",
+                      transition: "all 0.3s ease-in-out",
+                    },
+                  }}
+                >
+                  <RefreshIcon sx={{ color: "#0EA5E9", fontSize: "24px" }} />
+                </IconButton>
+              </Tooltip>
+            </Box>
           </Box>
 
           {/* Filter Section */}
@@ -308,6 +567,61 @@ const CloneDomain = () => {
             </FormControl>
           </Stack>
 
+          {/* Source Selection */}
+          <Stack direction={{ xs: "column", md: "row" }} spacing={2} sx={{ mb: 3 }}>
+            <FormControl sx={{ minWidth: 200 }}>
+              <InputLabel>Xem danh sách</InputLabel>
+              <Select
+                value={viewType}
+                onChange={(e) => {
+                  setViewType(e.target.value);
+                  fetchDomains(e.target.value);
+                }}
+                label="Xem danh sách"
+              >
+                <MenuItem value="all">Tất cả domain</MenuItem>
+                <MenuItem value="live">Đang đấu giá</MenuItem>
+                <MenuItem value="closed">Đã kết thúc</MenuItem>
+              </Select>
+            </FormControl>
+
+            <FormControl sx={{ minWidth: 200 }}>
+              <InputLabel>Chọn nguồn</InputLabel>
+              <Select
+                value={selectedSource}
+                onChange={(e) => {
+                  setSelectedSource(e.target.value);
+                  setSelectedType("");
+                }}
+                label="Chọn nguồn"
+              >
+                {sources.map((source) => (
+                  <MenuItem key={source.id} value={source.id}>
+                    {source.name}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            <FormControl sx={{ minWidth: 200 }} disabled={!selectedSource}>
+              <InputLabel>Chọn loại trang</InputLabel>
+              <Select
+                value={selectedType}
+                onChange={(e) => setSelectedType(e.target.value)}
+                label="Chọn loại trang"
+              >
+                {selectedSource &&
+                  sources
+                    .find((s) => s.id === selectedSource)
+                    ?.types.map((type) => (
+                      <MenuItem key={type.id} value={type.id}>
+                        {type.name}
+                      </MenuItem>
+                    ))}
+              </Select>
+            </FormControl>
+          </Stack>
+
           {error && (
             <Alert
               severity="error"
@@ -317,6 +631,27 @@ const CloneDomain = () => {
               }}
             >
               {error}
+            </Alert>
+          )}
+
+          {scrapingStatus && (
+            <Alert
+              severity={
+                scrapingStatus.includes("thành công") ? "success" : "info"
+              }
+              sx={{
+                marginBottom: 3,
+                borderRadius: "12px",
+                animation: "fadeOut 3s forwards",
+                "@keyframes fadeOut": {
+                  "0%": { opacity: 1 },
+                  "70%": { opacity: 1 },
+                  "100%": { opacity: 0 },
+                },
+              }}
+              onAnimationEnd={() => setScrapingStatus(null)}
+            >
+              {scrapingStatus}
             </Alert>
           )}
 
@@ -380,6 +715,38 @@ const CloneDomain = () => {
                   >
                     Site Gốc
                   </TableCell>
+                  <TableCell
+                    sx={{
+                      color: "#FFFFFF",
+                      fontWeight: "600",
+                      fontSize: "0.875rem",
+                      padding: "16px 24px",
+                      display: { xs: "none", md: "table-cell" },
+                    }}
+                  >
+                    Ngày kết thúc
+                  </TableCell>
+                  <TableCell
+                    sx={{
+                      color: "#FFFFFF",
+                      fontWeight: "600",
+                      fontSize: "0.875rem",
+                      padding: "16px 24px",
+                      display: { xs: "none", md: "table-cell" },
+                    }}
+                  >
+                    Thời gian thu thập
+                  </TableCell>
+                  <TableCell
+                    sx={{
+                      color: "#FFFFFF",
+                      fontWeight: "600",
+                      fontSize: "0.875rem",
+                      padding: "16px 24px",
+                    }}
+                  >
+                    Tác vụ
+                  </TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -387,68 +754,15 @@ const CloneDomain = () => {
                   filteredDomains
                     .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
                     .map((domain, index) => (
-                      <TableRow
+                      <TableRowContent
                         key={domain.id}
-                        sx={{
-                          "&:nth-of-type(odd)": {
-                            backgroundColor: "#F8FAFC",
-                          },
-                          "&:hover": {
-                            backgroundColor: "#E0F2FE",
-                            transform: "scale(1.01)",
-                            transition: "all 0.2s ease-in-out",
-                          },
-                        }}
-                      >
-                        <TableCell
-                          sx={{
-                            color: "#64748B",
-                            padding: "16px 24px",
-                            fontWeight: "500",
-                          }}
-                        >
-                          {page * rowsPerPage + index + 1}
-                        </TableCell>
-                        <TableCell sx={{ padding: "16px 24px" }}>
-                          <Typography
-                            sx={{
-                              color: "#0EA5E9",
-                              fontWeight: "600",
-                              fontSize: "0.875rem",
-                              "&:hover": {
-                                color: "#0369A1",
-                                cursor: "pointer",
-                              },
-                            }}
-                          >
-                            {domain.domain}
-                          </Typography>
-                        </TableCell>
-                        <TableCell
-                          sx={{
-                            color: "#64748B",
-                            padding: "16px 24px",
-                            display: { xs: "none", sm: "table-cell" },
-                            fontWeight: "500",
-                          }}
-                        >
-                          {domain.age} năm
-                        </TableCell>
-                        <TableCell
-                          sx={{
-                            color: "#64748B",
-                            padding: "16px 24px",
-                            display: { xs: "none", md: "table-cell" },
-                            fontWeight: "500",
-                          }}
-                        >
-                          {domain.source}
-                        </TableCell>
-                      </TableRow>
+                        domain={domain}
+                        index={index}
+                      />
                     ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={4} align="center" sx={{ py: 8 }}>
+                    <TableCell colSpan={7} align="center" sx={{ py: 8 }}>
                       <Typography
                         variant="body1"
                         sx={{ color: "#64748B", fontWeight: "500" }}
